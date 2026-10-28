@@ -1,0 +1,56 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+version: 2
+
+project_name: ghstat
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  - formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE
+      - README.md
+      - CHANGELOG.md
+
+release:
+  github:
+    owner: moexx399
+    name: ghstat
+
+checksum:
+  name_template: checksums.txt
+
+# Release notes come from changie via --release-notes (see
+# .github/workflows/release.yml). Do not set changelog.disable: it also skips
+# loading the --release-notes file, leaving the release body empty.
+
+homebrew_casks:
+  - name: ghstat
+    binaries: [ghstat]
+    homepage: https://github.com/moexx399/ghstat
+    description: GitHub Actions and commit check status for your repos, as a TUI, CLI summary and tmux badge
+    repository:
+      owner: moexx399
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    hooks:
+      post:
+        # install_steps (GoReleaser >= v2.19) renders Homebrew's
+        # postflight_steps; the older `install` renders deprecated postflight.
+        install_steps: |
+          on_macos do
+            run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ .StagedPath }}/ghstat"]
+          end
