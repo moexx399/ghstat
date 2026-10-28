@@ -16,27 +16,37 @@ type Repo struct {
 	Name, Branch string
 }
 
-// defaultConfigPath is $GHSTAT_CONFIG, else ghstat/repos.conf in the
-// user config dir, falling back to the ghws script's ~/.config/ghws/repos.conf
-// when only that exists.
+// defaultConfigPath is $GHSTAT_CONFIG, else the first existing of
+// $XDG_CONFIG_HOME/ghstat/repos.conf, ~/.config/ghstat/repos.conf (on macOS
+// too, so it can live in dotfiles), the OS config dir's ghstat/repos.conf,
+// and the ghws script's ~/.config/ghws/repos.conf.
 func defaultConfigPath() string {
 	if p := os.Getenv("GHSTAT_CONFIG"); p != "" {
 		return p
 	}
-	dir, err := os.UserConfigDir()
-	if err != nil {
-		return "repos.conf"
+	var candidates []string
+	if x := os.Getenv("XDG_CONFIG_HOME"); x != "" {
+		candidates = append(candidates, filepath.Join(x, "ghstat", "repos.conf"))
 	}
-	path := filepath.Join(dir, "ghstat", "repos.conf")
-	if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
-		if home, err := os.UserHomeDir(); err == nil {
-			legacy := filepath.Join(home, ".config", "ghws", "repos.conf")
-			if _, err := os.Stat(legacy); err == nil {
-				return legacy
-			}
+	home, _ := os.UserHomeDir()
+	if home != "" {
+		candidates = append(candidates, filepath.Join(home, ".config", "ghstat", "repos.conf"))
+	}
+	if dir, err := os.UserConfigDir(); err == nil {
+		candidates = append(candidates, filepath.Join(dir, "ghstat", "repos.conf"))
+	}
+	if home != "" {
+		candidates = append(candidates, filepath.Join(home, ".config", "ghws", "repos.conf"))
+	}
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			return c
 		}
 	}
-	return path
+	if len(candidates) == 0 {
+		return "repos.conf"
+	}
+	return candidates[0]
 }
 
 // loadRepos reads the repos file; blank lines and # comments are ignored.

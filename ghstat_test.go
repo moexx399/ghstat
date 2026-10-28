@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -16,6 +17,8 @@ import (
 // fakeGitHub serves the endpoints ghstat reads for two repos:
 // acme/api (default branch "trunk", a failing workflow, a paginated set of
 // check runs and an external status) and acme/gone (404).
+var lookups atomic.Int32 // per-workflow run lookups served by fakeGitHub
+
 func fakeGitHub(t *testing.T) *httptest.Server {
 	t.Helper()
 	ts := func(min int) string {
@@ -30,15 +33,42 @@ func fakeGitHub(t *testing.T) *httptest.Server {
 		}
 		reply(w, map[string]any{"default_branch": "trunk"})
 	})
+	mux.HandleFunc("GET /repos/acme/api/actions/workflows", func(w http.ResponseWriter, r *http.Request) {
+		reply(w, map[string]any{"workflows": []map[string]any{
+			{"id": 1, "name": "build", "state": "active"},
+			{"id": 2, "name": "lint", "state": "active"},
+			{"id": 3, "name": "nightly", "state": "active"},
+			{"id": 4, "name": "old-deploy", "state": "deleted"},
+			{"id": 5, "name": "release", "state": "active"},
+			{"id": 6, "name": "paused", "state": "disabled_manually"},
+		}})
+	})
 	mux.HandleFunc("GET /repos/acme/api/actions/runs", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("branch") != "trunk" {
 			t.Errorf("runs branch = %q", r.URL.Query().Get("branch"))
 		}
+		// Newest first. build ran twice, and was renamed in between.
 		reply(w, map[string]any{"workflow_runs": []map[string]any{
-			{"name": "build", "status": "completed", "conclusion": "failure", "html_url": "https://github.com/acme/api/actions/runs/2", "updated_at": ts(3)},
-			{"name": "lint", "status": "in_progress", "conclusion": nil, "html_url": "u", "updated_at": ts(1)},
-			{"name": "build", "status": "completed", "conclusion": "success", "html_url": "old", "updated_at": ts(60)},
+			{"workflow_id": 1, "name": "build", "status": "completed", "conclusion": "failure", "html_url": "https://github.com/acme/api/actions/runs/2", "updated_at": ts(3)},
+			{"workflow_id": 2, "name": "lint", "status": "in_progress", "conclusion": nil, "html_url": "u", "updated_at": ts(1)},
+			{"workflow_id": 4, "name": "old-deploy", "status": "completed", "conclusion": "failure", "html_url": "stale", "updated_at": ts(30)},
+			{"workflow_id": 6, "name": "paused", "status": "completed", "conclusion": "failure", "html_url": "stale", "updated_at": ts(40)},
+			{"workflow_id": 1, "name": "build-old-name", "status": "completed", "conclusion": "success", "html_url": "old", "updated_at": ts(60)},
 		}})
+	})
+	// Workflows missing from the recent runs are looked up one by one: nightly
+	// last ran long ago; release never ran on the branch.
+	mux.HandleFunc("GET /repos/acme/api/actions/workflows/{id}/runs", func(w http.ResponseWriter, r *http.Request) {
+		lookups.Add(1)
+		var runs []map[string]any
+		switch r.PathValue("id") {
+		case "3":
+			runs = []map[string]any{{"workflow_id": 3, "name": "nightly", "status": "completed", "conclusion": "success", "html_url": "n", "updated_at": ts(20000)}}
+		case "5":
+		default:
+			t.Errorf("unexpected lookup of workflow %s", r.PathValue("id"))
+		}
+		reply(w, map[string]any{"workflow_runs": runs})
 	})
 	mux.HandleFunc("GET /repos/acme/api/commits/trunk", func(w http.ResponseWriter, r *http.Request) {
 		reply(w, map[string]any{"sha": "0123456789abcdef"})
@@ -160,16 +190,22 @@ func TestFetchAll(t *testing.T) {
 		names = append(names, fmt.Sprintf("%s:%s:%v", c.Source, c.Name, c.State()))
 	}
 	want := []string{
-		fmt.Sprintf("A:build:%v", stateFailed),  // the newest run wins
-		fmt.Sprintf("A:lint:%v", stateRunning),  //
-		fmt.Sprintf("C:sonar:%v", stateRunning), // commit status
-		fmt.Sprintf("C:test:%v", statePassed),   // latest check run, from page 2
-	}
+		fmt.Sprintf("A:build:%v", stateFailed),   // the newest run wins, under the current name
+		fmt.Sprintf("A:lint:%v", stateRunning),   //
+		fmt.Sprintf("A:nightly:%v", statePassed), // not among recent runs; looked up
+		fmt.Sprintf("C:sonar:%v", stateRunning),  // commit status
+		fmt.Sprintf("C:test:%v", statePassed),    // latest check run, from page 2
+	} // deleted and disabled workflows, and ones never run on the branch, are left out
 	if strings.Join(names, " ") != strings.Join(want, " ") {
 		t.Fatalf("checks %v\nwant   %v", names, want)
 	}
-	if c := api.Counts(); c != (Counts{Passed: 1, Failed: 1, Running: 2}) {
+	if c := api.Counts(); c != (Counts{Passed: 2, Failed: 1, Running: 2}) {
 		t.Fatalf("counts %+v", c)
+	}
+	// Lookups of older workflows are remembered across refreshes.
+	before := lookups.Load()
+	if again := gh.fetchRepo(context.Background(), Repo{Name: "acme/api"}); len(again.Checks) != len(api.Checks) || lookups.Load() != before {
+		t.Fatalf("refetch: %d checks, %d new lookups", len(again.Checks), lookups.Load()-before)
 	}
 	if got[1].Label() != "gone" || len(got[1].Checks) != 0 || !strings.Contains(got[1].Errors[0], "404") {
 		t.Fatalf("gone: %+v", got[1])
@@ -188,7 +224,7 @@ func TestRenderListAndBadge(t *testing.T) {
 	statuses := gh.fetchAll(context.Background(), []Repo{{Name: "acme/api"}, {Name: "acme/gone", Branch: "release/1"}})
 
 	list := renderList(statuses, 40)
-	for _, s := range []string{"Legend: A=actions", "api", "A✗ build", "C✓ test", "gone (release/1)", "⚠  could not fetch"} {
+	for _, s := range []string{"Legend: A=latest run of each workflow", "api", "A✗ build", "C✓ test", "gone (release/1)", "⚠  could not fetch"} {
 		if !strings.Contains(list, s) {
 			t.Errorf("list missing %q:\n%s", s, list)
 		}
@@ -198,7 +234,7 @@ func TestRenderListAndBadge(t *testing.T) {
 		t.Errorf("list not wrapped:\n%s", list)
 	}
 
-	want := "#[fg=#6c7086]GH #[fg=#f38ba8]✗ 1 #[fg=#f9e2af]⟳ 2 #[fg=#9399b2]⚠ 1 #[fg=#a6e3a1]✓ 1#[fg=default]"
+	want := "#[fg=#6c7086]GH #[fg=#f38ba8]✗ 1 #[fg=#f9e2af]⟳ 2 #[fg=#9399b2]⚠ 1 #[fg=#a6e3a1]✓ 2#[fg=default]"
 	if got := renderBadge(statuses); got != want {
 		t.Fatalf("badge\n got %q\nwant %q", got, want)
 	}

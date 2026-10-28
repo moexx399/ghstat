@@ -19,9 +19,11 @@ tmux status-bar badges for check results and open pull requests.
    C ✓ SonarCloud   success        30m
 ```
 
-`A` is the latest Actions run of a workflow on the branch; `C` is a check run
-or commit status (external CI such as Azure Pipelines or SonarQube) on the
-branch's latest commit.
+`A` is the latest run on the branch of each of the repo's active workflows,
+however long ago it ran (re-runs replace earlier attempts; deleted and
+disabled workflows, and ones never run on the branch, are left out). `C` is
+a check run or commit status (external CI such as Azure Pipelines or
+SonarQube) on the branch's latest commit.
 
 ## Install
 
@@ -35,9 +37,8 @@ Or with Go: `go install github.com/moexx399/ghstat@latest`.
 
 ## Setup
 
-List repos in `~/.config/ghstat/repos.conf` (macOS:
-`~/Library/Application Support/ghstat/repos.conf`, or set
-`$GHSTAT_CONFIG`), one per line. Without a branch, the repo's default
+List repos in `~/.config/ghstat/repos.conf` (or under `$XDG_CONFIG_HOME`,
+on macOS too; set `$GHSTAT_CONFIG` for another file), one per line. Without a branch, the repo's default
 branch is used:
 
 ```text

@@ -157,7 +157,7 @@ func renderList(statuses []RepoStatus, width int) string {
 	indent := strings.Repeat(" ", col)
 
 	var b strings.Builder
-	b.WriteString(graySt.Render("Legend: A=actions  C=latest-commit checks/status") + "\n")
+	b.WriteString(graySt.Render("Legend: A=latest run of each workflow  C=latest-commit checks/status") + "\n")
 	for _, s := range statuses {
 		label := s.Label()
 		if lipgloss.Width(label) >= col {

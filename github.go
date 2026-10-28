@@ -22,6 +22,20 @@ type github struct {
 	base  string // API root, e.g. https://api.github.com
 	token string
 	http  *http.Client
+
+	// olderRuns remembers, per repo, branch and workflow, the latest run of
+	// workflows that have not run among the branch's recent runs (nil when
+	// never run on it). It stays correct until the workflow runs again, which
+	// puts the new run among the recent runs.
+	mu        sync.Mutex
+	olderRuns map[string]*workflowRun
+}
+
+type workflowRun struct {
+	WorkflowID               int64 `json:"workflow_id"`
+	Name, Status, Conclusion string
+	HTMLURL                  string    `json:"html_url"`
+	UpdatedAt                time.Time `json:"updated_at"`
 }
 
 // newGitHub uses $GH_TOKEN or $GITHUB_TOKEN, else `gh auth token`, for
@@ -106,9 +120,9 @@ func (g *github) fetchAll(ctx context.Context, repos []Repo) []RepoStatus {
 	return out
 }
 
-// fetchRepo reads the latest Actions run of each workflow on the branch, and
-// the check runs and commit statuses on the branch's latest commit. Sources
-// that fail are recorded in Errors; the rest are still shown.
+// fetchRepo reads the latest run of each workflow on the branch, and the
+// check runs and commit statuses on the branch's latest commit. Sources that
+// fail are recorded in Errors; the rest are still shown.
 func (g *github) fetchRepo(ctx context.Context, r Repo) RepoStatus {
 	s := RepoStatus{Repo: r, Branch: r.Branch}
 	repoPath := "/repos/" + r.Name
@@ -123,6 +137,13 @@ func (g *github) fetchRepo(ctx context.Context, r Repo) RepoStatus {
 		s.Branch, s.DefaultBranch = info.DefaultBranch, true
 	}
 
+	var commit struct{ SHA string }
+	if _, err := g.get(ctx, repoPath+"/commits/"+url.PathEscape(s.Branch), &commit); err != nil {
+		s.Errors = append(s.Errors, err.Error())
+		return s
+	}
+	s.SHA = commit.SHA
+
 	var mu sync.Mutex
 	add := func(checks []Check, err error) {
 		mu.Lock()
@@ -134,46 +155,95 @@ func (g *github) fetchRepo(ctx context.Context, r Repo) RepoStatus {
 	}
 	var wg sync.WaitGroup
 	wg.Go(func() { add(g.actionRuns(ctx, repoPath, s.Branch)) })
-	wg.Go(func() {
-		var commit struct{ SHA string }
-		if _, err := g.get(ctx, repoPath+"/commits/"+url.PathEscape(s.Branch), &commit); err != nil {
-			add(nil, err)
-			return
-		}
-		mu.Lock()
-		s.SHA = commit.SHA
-		mu.Unlock()
-		var inner sync.WaitGroup
-		inner.Go(func() { add(g.checkRuns(ctx, repoPath, commit.SHA)) })
-		inner.Go(func() { add(g.commitStatuses(ctx, repoPath, commit.SHA)) })
-		inner.Wait()
-	})
+	wg.Go(func() { add(g.checkRuns(ctx, repoPath, s.SHA)) })
+	wg.Go(func() { add(g.commitStatuses(ctx, repoPath, s.SHA)) })
 	wg.Wait()
 	sortChecks(s.Checks)
 	return s
 }
 
-// actionRuns returns the latest run of each workflow among the branch's
-// 100 most recent runs.
+// actionRuns returns the latest run on the branch of every active workflow
+// (deleted and disabled ones are left out). Runs are grouped by workflow, so
+// renaming a workflow or giving runs their own names does not split it.
+// Workflows absent from the branch's 100 most recent runs are looked up one
+// by one, once per process.
 func (g *github) actionRuns(ctx context.Context, repoPath, branch string) ([]Check, error) {
-	var page struct {
-		WorkflowRuns []struct {
-			Name, Status, Conclusion string
-			HTMLURL                  string    `json:"html_url"`
-			UpdatedAt                time.Time `json:"updated_at"`
-		} `json:"workflow_runs"`
-	}
-	q := url.Values{"branch": {branch}, "per_page": {"100"}}
-	if _, err := g.get(ctx, repoPath+"/actions/runs?"+q.Encode(), &page); err != nil {
-		return nil, err
-	}
-	var checks []Check
-	for _, r := range page.WorkflowRuns { // newest first
-		if !slices.ContainsFunc(checks, func(c Check) bool { return c.Name == r.Name }) {
-			checks = append(checks, Check{Name: r.Name, Source: SourceActions, Status: r.Status, Conclusion: r.Conclusion, URL: r.HTMLURL, Updated: r.UpdatedAt})
+	var workflows struct {
+		Workflows []struct {
+			ID          int64
+			Name, State string
 		}
 	}
-	return checks, nil
+	var recent struct {
+		WorkflowRuns []workflowRun `json:"workflow_runs"`
+	}
+	var wfErr, runsErr error
+	var wg sync.WaitGroup
+	wg.Go(func() { _, wfErr = g.get(ctx, repoPath+"/actions/workflows?per_page=100", &workflows) })
+	wg.Go(func() {
+		q := url.Values{"branch": {branch}, "per_page": {"100"}}
+		_, runsErr = g.get(ctx, repoPath+"/actions/runs?"+q.Encode(), &recent)
+	})
+	wg.Wait()
+	if err := cmpOr(wfErr, runsErr); err != nil {
+		return nil, err
+	}
+
+	latest := map[int64]*workflowRun{}
+	for i, r := range recent.WorkflowRuns { // newest first
+		if _, ok := latest[r.WorkflowID]; !ok {
+			latest[r.WorkflowID] = &recent.WorkflowRuns[i]
+		}
+	}
+	errs := make([]error, len(workflows.Workflows))
+	older := make([]*workflowRun, len(workflows.Workflows)) // written by the lookups below
+	for i, w := range workflows.Workflows {
+		if w.State != "active" || latest[w.ID] != nil {
+			continue
+		}
+		key := fmt.Sprintf("%s@%s#%d", repoPath, branch, w.ID)
+		g.mu.Lock()
+		run, known := g.olderRuns[key]
+		g.mu.Unlock()
+		if known {
+			latest[w.ID] = run
+			continue
+		}
+		wg.Go(func() {
+			var page struct {
+				WorkflowRuns []workflowRun `json:"workflow_runs"`
+			}
+			q := url.Values{"branch": {branch}, "per_page": {"1"}}
+			if _, errs[i] = g.get(ctx, fmt.Sprintf("%s/actions/workflows/%d/runs?%s", repoPath, w.ID, q.Encode()), &page); errs[i] != nil {
+				return
+			}
+			var run *workflowRun
+			if len(page.WorkflowRuns) > 0 {
+				run = &page.WorkflowRuns[0]
+			}
+			g.mu.Lock()
+			defer g.mu.Unlock()
+			if g.olderRuns == nil {
+				g.olderRuns = map[string]*workflowRun{}
+			}
+			g.olderRuns[key] = run
+			older[i] = run
+		})
+	}
+	wg.Wait()
+	for i, w := range workflows.Workflows {
+		if older[i] != nil {
+			latest[w.ID] = older[i]
+		}
+	}
+
+	var checks []Check
+	for _, w := range workflows.Workflows {
+		if r := latest[w.ID]; w.State == "active" && r != nil {
+			checks = append(checks, Check{Name: w.Name, Source: SourceActions, Status: r.Status, Conclusion: r.Conclusion, URL: r.HTMLURL, Updated: r.UpdatedAt})
+		}
+	}
+	return checks, cmpOr(errs...)
 }
 
 // checkRuns returns the latest check run of each name on the commit.
@@ -233,13 +303,15 @@ func (g *github) commitStatuses(ctx context.Context, repoPath, sha string) ([]Ch
 	return mapValues(latest), nil
 }
 
-func cmpOr(ts ...*time.Time) *time.Time {
-	for _, t := range ts {
-		if t != nil {
-			return t
+// cmpOr returns the first non-nil value.
+func cmpOr[T comparable](vs ...T) T {
+	var zero T
+	for _, v := range vs {
+		if v != zero {
+			return v
 		}
 	}
-	return nil
+	return zero
 }
 
 func mapValues(m map[string]Check) []Check {
