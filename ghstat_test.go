@@ -310,3 +310,31 @@ func TestStates(t *testing.T) {
 		}
 	}
 }
+
+func TestDefaultConfigPath(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("GHSTAT_CONFIG", "")
+	write := func(rel string) string {
+		p := filepath.Join(home, rel)
+		os.MkdirAll(filepath.Dir(p), 0o755)
+		os.WriteFile(p, []byte("a/b\n"), 0o644)
+		return p
+	}
+	if got, want := defaultConfigPath(), filepath.Join(home, ".config", "ghstat", "repos.conf"); got != want {
+		t.Fatalf("nothing exists: %s, want %s", got, want)
+	}
+	legacy := write(".config/ghws/repos.conf")
+	if got := defaultConfigPath(); got != legacy {
+		t.Fatalf("only ghws exists: %s", got)
+	}
+	dotfiles := write(".config/ghstat/repos.conf")
+	if got := defaultConfigPath(); got != dotfiles {
+		t.Fatalf("~/.config/ghstat should win: %s", got)
+	}
+	t.Setenv("GHSTAT_CONFIG", "/elsewhere")
+	if got := defaultConfigPath(); got != "/elsewhere" {
+		t.Fatalf("GHSTAT_CONFIG: %s", got)
+	}
+}
