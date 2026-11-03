@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -33,6 +34,7 @@ const usage = `Usage:
   ghstat list [flags]         print every repo's checks once
   ghstat badge [ci] [flags]   cached tmux status-bar badge of check results
   ghstat badge prs [flags]    cached tmux status-bar badge of open PRs (--since 7d)
+  ghstat wrapped [flags]      your year on GitHub: commits, PRs, reviews, security fixes
   ghstat version
 
 Repos come from a file with one owner/repo[:branch] per line (default branch
@@ -44,7 +46,7 @@ Flags:
 
 func run(args []string, stdout, stderr io.Writer) error {
 	cmd := "tui"
-	if len(args) > 0 && (args[0] == "list" || args[0] == "badge" || args[0] == "tui" || args[0] == "version") {
+	if len(args) > 0 && (args[0] == "list" || args[0] == "badge" || args[0] == "tui" || args[0] == "version" || args[0] == "wrapped") {
 		cmd, args = args[0], args[1:]
 	}
 	kind := "ci"
@@ -57,6 +59,9 @@ func run(args []string, stdout, stderr io.Writer) error {
 	if cmd == "version" {
 		fmt.Fprintln(stdout, version)
 		return nil
+	}
+	if cmd == "wrapped" {
+		return runWrapped(args, stdout, stderr)
 	}
 
 	fs := flag.NewFlagSet("ghstat "+cmd, flag.ContinueOnError)
@@ -194,4 +199,62 @@ func writeBadgeCache(statuses []RepoStatus) {
 	if cache, err := newBadgeCache("ci", 0); err == nil {
 		cache.write(renderBadge(statuses))
 	}
+}
+
+// runWrapped is `ghstat wrapped`: the user's year on GitHub.
+func runWrapped(args []string, stdout, stderr io.Writer) error {
+	now := time.Now()
+	fs := flag.NewFlagSet("ghstat wrapped", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	year := fs.Int("year", now.Year(), "the year to look back on (the current one runs to today)")
+	top := fs.Int("top", 15, "repos in the per-repo breakdown (0 for all)")
+	asJSON := fs.Bool("json", false, "print the numbers as JSON")
+	fs.Usage = func() {
+		fmt.Fprint(stderr, "Usage:\n  ghstat wrapped [flags]\n\nYour year across all of GitHub, overall and by repo.\n\nFlags:\n")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		fs.Usage()
+		return fmt.Errorf("unexpected arguments: %v", fs.Args())
+	}
+	if *top < 0 {
+		return fmt.Errorf("invalid --top %d", *top)
+	}
+	from, to, err := yearRange(*year, now)
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	gh, err := newGitHub(ctx)
+	if err != nil {
+		return err
+	}
+	f, isFile := stdout.(*os.File)
+	tty := isFile && term.IsTerminal(f.Fd())
+	if tty && !*asJSON {
+		fmt.Fprintf(stderr, "Gathering your %d on GitHub…\r", *year)
+	}
+	w, err := gh.wrapped(ctx, from, to)
+	if tty && !*asJSON {
+		fmt.Fprint(stderr, "\r\033[K")
+	}
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(w)
+	}
+	width := 100
+	if tty {
+		if tw, _, err := term.GetSize(f.Fd()); err == nil && tw > 0 {
+			width = tw
+		}
+	}
+	_, err = io.WriteString(stdout, renderWrapped(w, *top, width))
+	return err
 }
