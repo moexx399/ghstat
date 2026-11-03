@@ -147,7 +147,10 @@ type gqlRepo struct {
 	PrimaryLanguage *struct{ Name string }
 }
 
-const gqlRepoFields = `repository { nameWithOwner isPrivate primaryLanguage { name } }`
+const (
+	gqlRepoDetails = `nameWithOwner isPrivate primaryLanguage { name }`
+	gqlRepoFields  = `repository { ` + gqlRepoDetails + ` }`
+)
 
 type gqlError struct {
 	Message string
@@ -194,6 +197,29 @@ func (b *wrappedBuilder) repo(r gqlRepo) *RepoWrapped {
 	return e
 }
 
+// searchTally is one kind of activity counted through search.
+type searchTally struct {
+	name  string
+	total *int
+	count func(*RepoWrapped) *int
+	fetch func() ([]gqlRepo, int, error)
+	repos []gqlRepo // one entry per result
+	found int
+}
+
+// raise lifts each repo's count to its number of entries in found. Search
+// and the contribution graph each miss things, so the higher count stands.
+func (b *wrappedBuilder) raise(found []gqlRepo, count func(*RepoWrapped) *int) {
+	n := map[string]int{}
+	for _, r := range found {
+		n[r.NameWithOwner]++
+	}
+	for _, r := range found {
+		c := count(b.repo(r))
+		*c = max(*c, n[r.NameWithOwner])
+	}
+}
+
 func (b *wrappedBuilder) warn(format string, args ...any) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -208,13 +234,41 @@ func (g *github) wrapped(ctx context.Context, from, to time.Time) (*Wrapped, err
 	if err := g.wrappedSummary(ctx, b); err != nil {
 		return nil, err
 	}
+	w := b.w
+	period := from.Format(time.DateOnly) + ".." + to.Format(time.DateOnly)
+	// The contribution graph can leave out private repos entirely, without
+	// counting them as restricted, so search for the same activity too.
+	tallies := []*searchTally{
+		{name: "commits", total: &w.Commits, count: func(r *RepoWrapped) *int { return &r.Commits }, fetch: func() ([]gqlRepo, int, error) {
+			return g.searchCommits(ctx, fmt.Sprintf("author:%s author-date:%s", w.Login, period))
+		}},
+		{name: "PRs opened", total: &w.PRsOpened, count: func(r *RepoWrapped) *int { return &r.PRsOpened }, fetch: func() ([]gqlRepo, int, error) {
+			return g.searchRepos(ctx, fmt.Sprintf("is:pr author:%s created:%s", w.Login, period))
+		}},
+		{name: "issues", total: &w.Issues, count: func(r *RepoWrapped) *int { return &r.Issues }, fetch: func() ([]gqlRepo, int, error) {
+			return g.searchRepos(ctx, fmt.Sprintf("is:issue author:%s created:%s", w.Login, period))
+		}},
+	}
 	var wg sync.WaitGroup
 	var reviews []reviewNode
 	var merged []mergedPR
+	for _, t := range tallies {
+		wg.Go(func() {
+			var err error
+			if t.repos, t.found, err = t.fetch(); err != nil {
+				b.warn("%s: %v", t.name, err)
+			} else if t.found > len(t.repos) {
+				b.warn("%s: per-repo counts cover %d of %d (search limit)", t.name, len(t.repos), t.found)
+			}
+		})
+	}
 	wg.Go(func() {
+		var capped bool
 		var err error
-		if reviews, err = g.wrappedReviews(ctx, from, to); err != nil {
-			b.warn("approvals: %v", err)
+		if reviews, capped, err = g.wrappedReviews(ctx, w.Login, from, to); err != nil {
+			b.warn("reviews: %v", err)
+		} else if capped {
+			b.warn("reviews: approvals and reviews cover the first 1,000 reviewed PRs (search limit)")
 		}
 	})
 	wg.Go(func() {
@@ -230,19 +284,32 @@ func (g *github) wrapped(ctx context.Context, from, to time.Time) (*Wrapped, err
 	})
 	wg.Wait()
 
+	graph := w.Commits + w.PRsOpened + w.Issues + w.Reviews
+	for _, t := range tallies {
+		*t.total = max(*t.total, t.found)
+		b.raise(t.repos, t.count)
+	}
+	reviewed := make([]gqlRepo, 0, len(reviews))
 	for _, r := range reviews {
+		reviewed = append(reviewed, r.Repository)
 		e := b.repo(r.Repository)
-		switch r.PullRequestReview.State {
+		switch r.State {
 		case "APPROVED":
 			b.w.Approvals++
 			e.Approvals++
-			if r.PullRequest.Author.Typename == "Bot" {
+			if r.Author == "Bot" {
 				b.w.BotPRsApproved++
 			}
 		case "CHANGES_REQUESTED":
 			b.w.ChangesRequested++
 		}
 	}
+	w.Reviews = max(w.Reviews, len(reviews))
+	b.raise(reviewed, func(r *RepoWrapped) *int { return &r.Reviews })
+	if w.Commits+w.PRsOpened+w.Issues+w.Reviews > graph {
+		b.warn("contributions, active days, streaks and the month chart come from GitHub's contribution graph, which left out some of this activity")
+	}
+	g.fillLanguages(ctx, b)
 	var mergeTimes []time.Duration
 	for _, p := range merged {
 		e := b.repo(p.Repository)
@@ -475,53 +542,177 @@ func calendarStats(days []calendarDay, to time.Time) CalendarStats {
 }
 
 type reviewNode struct {
-	PullRequestReview struct{ State string }
-	PullRequest       struct {
-		Author struct {
-			Typename string `json:"__typename"`
-		}
-	}
+	State      string
+	Author     string // the PR author's type: User, Bot, ...
 	Repository gqlRepo
 }
 
-// wrappedReviews lists every PR review the user submitted in the period.
-func (g *github) wrappedReviews(ctx context.Context, from, to time.Time) ([]reviewNode, error) {
-	const query = `query($from: DateTime!, $to: DateTime!, $after: String) { viewer {
-  contributionsCollection(from: $from, to: $to) {
-    pullRequestReviewContributions(first: 100, after: $after) {
-      pageInfo { hasNextPage endCursor }
-      nodes { pullRequestReview { state } pullRequest { author { __typename } } ` + gqlRepoFields + ` }
-    }
+// wrappedReviews lists the reviews the user submitted in the period on other
+// people's PRs, and whether search's limit of 1,000 PRs cut the list short.
+// Search can only narrow down PRs, so it finds those that could hold such a
+// review, and their reviews are checked by date.
+func (g *github) wrappedReviews(ctx context.Context, login string, from, to time.Time) ([]reviewNode, bool, error) {
+	const query = `query($q: String!, $login: String!, $after: String) {
+  search(query: $q, type: ISSUE, first: 100, after: $after) {
+    issueCount
+    pageInfo { hasNextPage endCursor }
+    nodes { ... on PullRequest { author { __typename } reviews(first: 100, author: $login) { nodes { state submittedAt } } ` + gqlRepoFields + ` } }
   }
-} }`
+}`
+	q := fmt.Sprintf("is:pr reviewed-by:%[1]s -author:%[1]s created:<=%s updated:>=%s", login, to.UTC().Format(time.DateOnly), from.UTC().Format(time.DateOnly))
+	vars := map[string]any{"q": q, "login": login, "after": nil}
 	var out []reviewNode
-	vars := map[string]any{"from": from.Format(time.RFC3339), "to": to.Format(time.RFC3339), "after": nil}
-	for page := 0; page < 100; page++ {
+	seen, total := 0, 0
+	for page := 0; page < 10; page++ {
 		data, _, err := g.graphql(ctx, query, vars)
 		if err != nil {
-			return out, err
+			return out, false, err
 		}
 		var resp struct {
-			Viewer struct {
-				ContributionsCollection struct {
-					PullRequestReviewContributions struct {
-						PageInfo pageInfo
-						Nodes    []reviewNode
+			Search struct {
+				IssueCount int
+				PageInfo   pageInfo
+				Nodes      []struct {
+					Author struct {
+						Typename string `json:"__typename"`
 					}
+					Reviews struct {
+						Nodes []struct {
+							State       string
+							SubmittedAt *time.Time
+						}
+					}
+					Repository gqlRepo
 				}
 			}
 		}
 		if err := json.Unmarshal(data, &resp); err != nil {
-			return out, err
+			return out, false, err
 		}
-		conn := resp.Viewer.ContributionsCollection.PullRequestReviewContributions
-		out = append(out, conn.Nodes...)
-		if !conn.PageInfo.HasNextPage {
+		total = resp.Search.IssueCount
+		seen += len(resp.Search.Nodes)
+		for _, p := range resp.Search.Nodes {
+			for _, r := range p.Reviews.Nodes {
+				if r.SubmittedAt != nil && !r.SubmittedAt.Before(from) && !r.SubmittedAt.After(to) {
+					out = append(out, reviewNode{State: r.State, Author: p.Author.Typename, Repository: p.Repository})
+				}
+			}
+		}
+		if !resp.Search.PageInfo.HasNextPage {
 			break
 		}
-		vars["after"] = conn.PageInfo.EndCursor
+		vars["after"] = resp.Search.PageInfo.EndCursor
 	}
-	return out, nil
+	return out, total > seen, nil
+}
+
+// searchRepos returns the repo of each PR or issue matching q (search returns
+// at most 1,000), and their total count.
+func (g *github) searchRepos(ctx context.Context, q string) ([]gqlRepo, int, error) {
+	const query = `query($q: String!, $after: String) {
+  search(query: $q, type: ISSUE, first: 100, after: $after) {
+    issueCount
+    pageInfo { hasNextPage endCursor }
+    nodes { ... on PullRequest { ` + gqlRepoFields + ` } ... on Issue { ` + gqlRepoFields + ` } }
+  }
+}`
+	vars := map[string]any{"q": q, "after": nil}
+	var out []gqlRepo
+	total := 0
+	for page := 0; page < 10; page++ {
+		data, _, err := g.graphql(ctx, query, vars)
+		if err != nil {
+			return out, total, err
+		}
+		var resp struct {
+			Search struct {
+				IssueCount int
+				PageInfo   pageInfo
+				Nodes      []struct{ Repository gqlRepo }
+			}
+		}
+		if err := json.Unmarshal(data, &resp); err != nil {
+			return out, total, err
+		}
+		total = resp.Search.IssueCount
+		for _, n := range resp.Search.Nodes {
+			if n.Repository.NameWithOwner != "" {
+				out = append(out, n.Repository)
+			}
+		}
+		if !resp.Search.PageInfo.HasNextPage {
+			break
+		}
+		vars["after"] = resp.Search.PageInfo.EndCursor
+	}
+	return out, total, nil
+}
+
+// searchCommits returns the repo of each commit matching q (search returns at
+// most 1,000), and their total count. GraphQL cannot search commits, and REST
+// does not give each repo's language: see fillLanguages.
+func (g *github) searchCommits(ctx context.Context, q string) ([]gqlRepo, int, error) {
+	next := "/search/commits?" + url.Values{"q": {q}, "per_page": {"100"}}.Encode()
+	var out []gqlRepo
+	total := 0
+	for next != "" {
+		var page struct {
+			TotalCount int `json:"total_count"`
+			Items      []struct {
+				Repository struct {
+					FullName string `json:"full_name"`
+					Private  bool   `json:"private"`
+				} `json:"repository"`
+			} `json:"items"`
+		}
+		var err error
+		if next, err = g.get(ctx, next, &page); err != nil {
+			return out, total, err
+		}
+		total = page.TotalCount
+		for _, c := range page.Items {
+			out = append(out, gqlRepo{NameWithOwner: c.Repository.FullName, IsPrivate: c.Repository.Private})
+		}
+	}
+	return out, total, nil
+}
+
+// fillLanguages looks up the primary language of the repos with commits that
+// have none yet, up to 25 repos per request.
+func (g *github) fillLanguages(ctx context.Context, b *wrappedBuilder) {
+	var names []string
+	for name, r := range b.repos {
+		if r.Commits > 0 && r.Language == "" {
+			names = append(names, name)
+		}
+	}
+	slices.Sort(names)
+	for start := 0; start < len(names); start += 25 {
+		vars := map[string]any{}
+		params := []string{}
+		fields := []string{}
+		for i, name := range names[start:min(start+25, len(names))] {
+			owner, repo, _ := strings.Cut(name, "/")
+			vars[fmt.Sprintf("o%d", i)], vars[fmt.Sprintf("n%d", i)] = owner, repo
+			params = append(params, fmt.Sprintf("$o%d: String!, $n%[1]d: String!", i))
+			fields = append(fields, fmt.Sprintf("r%d: repository(owner: $o%[1]d, name: $n%[1]d) { %s }", i, gqlRepoDetails))
+		}
+		data, _, err := g.graphql(ctx, "query("+strings.Join(params, ", ")+") { "+strings.Join(fields, " ")+" }", vars)
+		if err != nil {
+			b.warn("languages: %v", err)
+			continue
+		}
+		var resp map[string]*gqlRepo
+		if err := json.Unmarshal(data, &resp); err != nil {
+			b.warn("languages: %v", err)
+			continue
+		}
+		for _, r := range resp {
+			if r != nil {
+				b.repo(*r)
+			}
+		}
+	}
 }
 
 type pageInfo struct {

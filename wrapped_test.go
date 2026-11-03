@@ -13,8 +13,10 @@ import (
 // fakeWrapped serves the GraphQL and REST endpoints `ghstat wrapped` reads,
 // for user octo in 2025: commits to acme/api and the private acme/web,
 // reviews (paginated) in acme/api and other/lib, two merged PRs, and
-// security alerts some of which the token cannot read.
-func fakeWrapped(t *testing.T) *httptest.Server {
+// security alerts some of which the token cannot read. With hidden, the
+// contribution graph is empty and search also finds the private acme/secret,
+// as when the graph leaves private repos out.
+func fakeWrapped(t *testing.T, hidden bool) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
 	reply := func(w http.ResponseWriter, v any) { json.NewEncoder(w).Encode(v) }
@@ -26,6 +28,17 @@ func fakeWrapped(t *testing.T) *httptest.Server {
 		return r
 	}
 	api, web, lib := repo("acme/api", "Go", false), repo("acme/web", "TypeScript", true), repo("other/lib", "", false)
+	secret := repo("acme/secret", "", true)
+	withRepo := func(r map[string]any, n int) []any {
+		var out []any
+		for range n {
+			out = append(out, map[string]any{"repository": r})
+		}
+		return out
+	}
+	searchReply := func(nodes []any) map[string]any {
+		return map[string]any{"data": map[string]any{"search": map[string]any{"issueCount": len(nodes), "pageInfo": map[string]any{"hasNextPage": false}, "nodes": nodes}}}
+	}
 	days := func(counts map[string]int) []map[string]any {
 		var out []map[string]any
 		for d := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC); d.Year() == 2025; d = d.AddDate(0, 0, 1) {
@@ -76,19 +89,52 @@ func fakeWrapped(t *testing.T) *httptest.Server {
 				"w3": map[string]any{"commitContributionsByRepository": []any{}},
 				"w4": map[string]any{"commitContributionsByRepository": []any{}},
 			}
+			if hidden {
+				viewer["all"] = map[string]any{"contributionCalendar": map[string]any{"totalContributions": 0, "weeks": []any{}}}
+				for _, w := range []string{"w0", "w1"} {
+					viewer[w] = map[string]any{"commitContributionsByRepository": []any{}}
+				}
+			}
 			reply(w, map[string]any{"data": map[string]any{"viewer": viewer}})
 
-		case strings.Contains(q, "pullRequestReviewContributions(first"):
-			review := func(state, author string, r map[string]any) map[string]any {
-				return map[string]any{"pullRequestReview": map[string]any{"state": state}, "pullRequest": map[string]any{"author": map[string]any{"__typename": author}}, "repository": r}
+		case strings.Contains(q, "reviews(first"):
+			if vars["q"] != "is:pr reviewed-by:octo -author:octo created:<=2025-12-31 updated:>=2025-01-01" || vars["login"] != "octo" {
+				t.Errorf("reviews vars %v", vars)
 			}
-			conn := map[string]any{"pageInfo": map[string]any{"hasNextPage": true, "endCursor": "c1"}, "nodes": []any{
-				review("APPROVED", "User", api), review("APPROVED", "Bot", api), review("CHANGES_REQUESTED", "User", lib),
-			}}
+			pr := func(author string, r map[string]any, reviews ...map[string]any) map[string]any {
+				return map[string]any{"author": map[string]any{"__typename": author}, "reviews": map[string]any{"nodes": reviews}, "repository": r}
+			}
+			review := func(state, at string) map[string]any { return map[string]any{"state": state, "submittedAt": at} }
+			const in = "2025-06-01T00:00:00Z"
+			nodes := []any{
+				pr("User", api, review("APPROVED", in), review("APPROVED", "2024-06-01T00:00:00Z"), map[string]any{"state": "PENDING"}),
+				pr("Bot", api, review("APPROVED", in)),
+				pr("User", lib, review("CHANGES_REQUESTED", in)),
+			}
+			next := map[string]any{"hasNextPage": true, "endCursor": "c1"}
 			if vars["after"] == "c1" {
-				conn = map[string]any{"pageInfo": map[string]any{"hasNextPage": false}, "nodes": []any{review("APPROVED", "User", lib)}}
+				nodes = []any{pr("User", lib, review("APPROVED", in))}
+				if hidden {
+					nodes = append(nodes, pr("User", secret, review("APPROVED", in)))
+				}
+				next = map[string]any{"hasNextPage": false}
 			}
-			reply(w, map[string]any{"data": map[string]any{"viewer": map[string]any{"contributionsCollection": map[string]any{"pullRequestReviewContributions": conn}}}})
+			reply(w, map[string]any{"data": map[string]any{"search": map[string]any{"issueCount": 4, "pageInfo": next, "nodes": nodes}}})
+
+		case strings.Contains(q, "... on Issue"):
+			var nodes []any
+			switch vars["q"] {
+			case "is:pr author:octo created:2025-01-01..2025-12-31":
+				nodes = withRepo(api, 5)
+			case "is:issue author:octo created:2025-01-01..2025-12-31":
+				nodes = withRepo(web, 2)
+			default:
+				t.Errorf("search %q", vars["q"])
+			}
+			if hidden {
+				nodes = append(nodes, withRepo(secret, 1)...)
+			}
+			reply(w, searchReply(nodes))
 
 		case strings.Contains(q, "search(query: $q"):
 			if vars["q"] != "is:pr is:merged author:octo merged:2025-01-01..2025-12-31" {
@@ -127,9 +173,32 @@ func fakeWrapped(t *testing.T) *httptest.Server {
 			}
 			reply(w, map[string]any{"data": data, "errors": errs})
 
+		case strings.Contains(q, "r0: repository"):
+			if vars["o0"] != "acme" || vars["n0"] != "secret" || vars["o1"] != nil {
+				t.Errorf("language lookup vars %v", vars)
+			}
+			reply(w, map[string]any{"data": map[string]any{"r0": repo("acme/secret", "Rust", true)}})
+
 		default:
 			t.Errorf("unexpected query %s", q)
 		}
+	})
+	mux.HandleFunc("GET /search/commits", func(w http.ResponseWriter, r *http.Request) {
+		if q := r.URL.Query().Get("q"); q != "author:octo author-date:2025-01-01..2025-12-31" {
+			t.Errorf("commit search %q", q)
+		}
+		item := func(name string, private bool) map[string]any {
+			return map[string]any{"repository": map[string]any{"full_name": name, "private": private}}
+		}
+		var items []any
+		for range 8 {
+			items = append(items, item("acme/api", false))
+		}
+		items = append(items, item("acme/web", true), item("acme/web", true))
+		if hidden {
+			items = append(items, item("acme/secret", true), item("acme/secret", true), item("acme/secret", true))
+		}
+		reply(w, map[string]any{"total_count": len(items), "items": items})
 	})
 	mux.HandleFunc("GET /repos/{owner}/{repo}/code-scanning/alerts", func(w http.ResponseWriter, r *http.Request) {
 		if r.PathValue("owner")+"/"+r.PathValue("repo") != "acme/api" {
@@ -160,7 +229,7 @@ func fakeWrapped(t *testing.T) *httptest.Server {
 func itoa(i int) string { return string(rune('0' + i)) }
 
 func TestWrapped(t *testing.T) {
-	srv := fakeWrapped(t)
+	srv := fakeWrapped(t, false)
 	gh := &github{base: srv.URL, token: "test-token", http: srv.Client()}
 	from, to, err := yearRange(2025, time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC))
 	if err != nil {
@@ -222,6 +291,36 @@ func TestWrapped(t *testing.T) {
 	}
 	if !strings.Contains(out, "acme/web 🔒") || strings.Contains(out, "other/lib") || !strings.Contains(renderWrapped(w, 0, 100), "other/lib") {
 		t.Errorf("--top not applied:\n%s", out)
+	}
+}
+
+// The contribution graph can omit private repos without saying so, so search
+// must still find the activity in them.
+func TestWrappedActivityHiddenFromGraph(t *testing.T) {
+	srv := fakeWrapped(t, true)
+	gh := &github{base: srv.URL, token: "test-token", http: srv.Client()}
+	from, to, err := yearRange(2025, time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := gh.wrapped(context.Background(), from, to)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.Commits != 13 || w.PRsOpened != 6 || w.Issues != 3 || w.Reviews != 5 || w.Approvals != 4 || w.BotPRsApproved != 1 || w.ChangesRequested != 1 {
+		t.Errorf("totals %+v", w)
+	}
+	var got RepoWrapped
+	for _, r := range w.Repos {
+		if r.Name == "acme/secret" {
+			got = r
+		}
+	}
+	if want := (RepoWrapped{Name: "acme/secret", Private: true, Language: "Rust", Commits: 3, PRsOpened: 1, Reviews: 1, Approvals: 1, Issues: 1}); got != want {
+		t.Errorf("repo %+v\nwant %+v", got, want)
+	}
+	if len(w.Warnings) != 1 || !strings.Contains(w.Warnings[0], "contribution graph") {
+		t.Errorf("warnings %v", w.Warnings)
 	}
 }
 

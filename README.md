@@ -90,6 +90,9 @@ GitHub (not just the repos file): the current year up to today, or any
   Dependabot's), change requests, issues opened, repos created, and
   security vulnerabilities fixed (Dependabot alerts by severity, code
   scanning alerts, and secret scanning alerts you resolved).
+  Commits, PRs, issues and reviews are also counted through search, because
+  the contribution graph can leave out private repos; contributions, active
+  days and streaks come from the graph alone.
 - **Highlights**: top repo, most reviewed repo, top languages, longest and
   current streaks, busiest day, favourite weekday, biggest merged PR, and a
   persona for the year.
