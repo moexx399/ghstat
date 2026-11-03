@@ -1,0 +1,3 @@
+kind: Added
+body: '`ghstat wrapped`: a year in review across all of GitHub, overall and by repo — commits, PRs opened and merged, reviews and approvals, security alerts fixed, streaks, languages and more (`--year`, `--top`, `--json`).'
+time: 2026-11-03T12:00:00.000000+00:00

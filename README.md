@@ -62,6 +62,8 @@ ghstat list               print every repo's checks once
 ghstat badge [--ttl 5m]   print the cached check-results badge for tmux
 ghstat badge prs [--since 7d] [--ttl 5m]
                           print the cached open pull request badge for tmux
+ghstat wrapped [--year 2025] [--top 15] [--json]
+                          your year on GitHub, overall and by repo
 ```
 
 All take `--config FILE` and `--branch BRANCH` (check that branch in every
@@ -75,6 +77,35 @@ repo; the PR badge counts open PRs into any branch).
 | `f` | only repos with failing, running or unreachable checks |
 | `r` | refresh (also automatic every `--refresh`) |
 | `q` | quit |
+
+### Wrapped
+
+`ghstat wrapped` is a year in review for the signed-in user across all of
+GitHub (not just the repos file): the current year up to today, or any
+`--year`.
+
+- **In numbers**: contributions and active days, commits, pull requests
+  opened and merged (with lines added and removed and the median time to
+  merge), reviews, PR approvals (and how many were bot PRs such as
+  Dependabot's), change requests, issues opened, repos created, and
+  security vulnerabilities fixed (Dependabot alerts by severity, code
+  scanning alerts, and secret scanning alerts you resolved).
+- **Highlights**: top repo, most reviewed repo, top languages, longest and
+  current streaks, busiest day, favourite weekday, biggest merged PR, and a
+  persona for the year.
+- **Month by month**: a sparkline of contributions.
+- **By repo**: commits, PRs opened and merged, reviews, approvals, issues,
+  lines changed and security fixes per repo (`--top 0` for every repo).
+
+`--json` prints the same numbers for scripting.
+
+Commits are counted the way your profile's contribution graph counts them
+(default branch, not forks). GitHub does not record who fixed a Dependabot or
+code scanning alert, so those count every fix in the repos you contributed
+to; they need a token that can read the repo's security alerts, and repos
+whose alerts it cannot read are reported. Secret scanning counts only alerts
+you resolved yourself. Merged PR details cover at most the 1,000 most recent
+(a GitHub search limit); the total is always exact.
 
 ### tmux
 
