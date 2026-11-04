@@ -150,7 +150,7 @@ func fakeWrapped(t *testing.T, hidden bool) *httptest.Server {
 
 		case strings.Contains(q, "vulnerabilityAlerts"):
 			alert := func(at string, sev string) map[string]any {
-				return map[string]any{"fixedAt": at, "securityVulnerability": map[string]any{"severity": sev}}
+				return map[string]any{"fixedAt": at, "vulnerableManifestPath": "go.mod", "securityVulnerability": map[string]any{"severity": sev}}
 			}
 			if vars["after"] == "v1" {
 				reply(w, map[string]any{"data": map[string]any{"repository": map[string]any{"vulnerabilityAlerts": map[string]any{
@@ -172,6 +172,33 @@ func fakeWrapped(t *testing.T, hidden bool) *httptest.Server {
 				}
 			}
 			reply(w, map[string]any{"data": data, "errors": errs})
+
+		case strings.Contains(q, "history(first"):
+			if vars["o"] != "acme" || vars["n"] != "api" || vars["path"] != "go.mod" {
+				t.Errorf("manifest vars %v", vars)
+			}
+			pr := func(mergedAt, mergedBy string) map[string]any {
+				return map[string]any{"mergedAt": mergedAt, "mergedBy": map[string]any{"login": mergedBy}, "author": map[string]any{"__typename": "Bot", "login": "dependabot"},
+					"files": map[string]any{"pageInfo": map[string]any{}, "nodes": []any{map[string]any{"path": "go.mod"}}}}
+			}
+			var prs, commits []any
+			switch vars["until"] {
+			case "2025-02-01T00:00:00Z": // a bot's PR the user merged
+				prs = []any{pr("2025-01-31T23:59:00Z", "Octo")}
+				commits = []any{map[string]any{"committedDate": "2025-01-31T23:50:00Z", "author": map[string]any{"user": nil},
+					"associatedPullRequests": map[string]any{"nodes": []any{map[string]any{"mergedAt": "2025-01-31T23:59:00Z"}}}}}
+			case "2025-03-01T00:00:00Z": // a bot's PR someone else merged
+				prs = []any{pr("2025-02-28T23:59:00Z", "someone")}
+			case "2025-09-01T00:00:00Z": // pushed by the user
+				commits = []any{map[string]any{"committedDate": "2025-08-31T23:59:00Z", "author": map[string]any{"user": map[string]any{"login": "octo"}},
+					"associatedPullRequests": map[string]any{"nodes": []any{}}}}
+			default:
+				t.Errorf("manifest vars %v", vars)
+			}
+			reply(w, map[string]any{"data": map[string]any{
+				"search":     map[string]any{"pageInfo": map[string]any{}, "nodes": prs},
+				"repository": map[string]any{"defaultBranchRef": map[string]any{"target": map[string]any{"history": map[string]any{"pageInfo": map[string]any{}, "nodes": commits}}}},
+			}})
 
 		case strings.Contains(q, "r0: repository"):
 			if vars["o0"] != "acme" || vars["n0"] != "secret" || vars["o1"] != nil {
@@ -199,17 +226,6 @@ func fakeWrapped(t *testing.T, hidden bool) *httptest.Server {
 			items = append(items, item("acme/secret", true), item("acme/secret", true), item("acme/secret", true))
 		}
 		reply(w, map[string]any{"total_count": len(items), "items": items})
-	})
-	mux.HandleFunc("GET /repos/{owner}/{repo}/code-scanning/alerts", func(w http.ResponseWriter, r *http.Request) {
-		if r.PathValue("owner")+"/"+r.PathValue("repo") != "acme/api" {
-			http.Error(w, `{"message":"Advanced Security must be enabled"}`, http.StatusForbidden)
-			return
-		}
-		reply(w, []any{
-			map[string]any{"fixed_at": "2025-06-01T00:00:00Z", "updated_at": "2025-06-01T00:00:00Z"},
-			map[string]any{"fixed_at": "2024-06-01T00:00:00Z", "updated_at": "2024-06-01T00:00:00Z"},
-			map[string]any{"fixed_at": "2025-06-01T00:00:00Z", "updated_at": "2024-01-01T00:00:00Z"}, // after the stop
-		})
 	})
 	mux.HandleFunc("GET /repos/{owner}/{repo}/secret-scanning/alerts", func(w http.ResponseWriter, r *http.Request) {
 		if r.PathValue("owner")+"/"+r.PathValue("repo") != "acme/web" {
@@ -250,8 +266,8 @@ func TestWrapped(t *testing.T) {
 		t.Errorf("merged: +%d -%d median %ds biggest %+v", w.Additions, w.Deletions, w.MedianMergeSeconds, w.BiggestPR)
 	}
 	sec := w.Security
-	if sec.DependabotFixed != 3 || sec.BySeverity["critical"] != 1 || sec.BySeverity["high"] != 1 || sec.BySeverity["moderate"] != 1 ||
-		sec.CodeScanningFixed != 1 || sec.SecretsResolved != 1 || sec.ReposChecked != 3 || sec.ReposUnavailable != 0 {
+	if sec.DependabotFixed != 2 || sec.BySeverity["critical"] != 0 || sec.BySeverity["high"] != 1 || sec.BySeverity["moderate"] != 1 ||
+		sec.SecretsResolved != 1 || sec.ReposChecked != 3 || sec.ReposUnavailable != 0 {
 		t.Errorf("security %+v", sec)
 	}
 	c := w.Calendar
@@ -262,7 +278,7 @@ func TestWrapped(t *testing.T) {
 		t.Errorf("languages %+v", w.Languages)
 	}
 	want := map[string]RepoWrapped{
-		"acme/api":  {Name: "acme/api", Language: "Go", Commits: 8, PRsOpened: 5, PRsMerged: 2, Reviews: 7, Approvals: 2, Additions: 105, Deletions: 510, DependabotFixed: 3, CodeScanningFixed: 1},
+		"acme/api":  {Name: "acme/api", Language: "Go", Commits: 8, PRsOpened: 5, PRsMerged: 2, Reviews: 7, Approvals: 2, Additions: 105, Deletions: 510, DependabotFixed: 2},
 		"other/lib": {Name: "other/lib", Reviews: 3, Approvals: 1},
 		"acme/web":  {Name: "acme/web", Private: true, Language: "TypeScript", Commits: 2, Issues: 2, SecretsResolved: 1},
 	}
@@ -281,7 +297,7 @@ func TestWrapped(t *testing.T) {
 	out := renderWrapped(w, 2, 100)
 	for _, s := range []string{
 		"GitHub Wrapped 2025", "@octo (Octo Cat)", "Jan 1 – Dec 31, 2025", "commits", "across 2 repos",
-		"+105 −510 lines · median 10h to merge", "1 bot PR approved", "Dependabot 3 (1 critical, 1 high, 1 moderate)",
+		"+105 −510 lines · median 10h to merge", "1 bot PR approved", "Dependabot 2 (1 high, 1 moderate)",
 		"secrets you resolved 1", "4 private contributions", "Go 80% · TypeScript 20%", "Tuesdays", "The Gatekeeper",
 		"Tue, Mar 4", "By repo (top 2 of 3; --top 0 for all)", "acme/api",
 	} {
@@ -291,6 +307,68 @@ func TestWrapped(t *testing.T) {
 	}
 	if !strings.Contains(out, "acme/web 🔒") || strings.Contains(out, "other/lib") || !strings.Contains(renderWrapped(w, 0, 100), "other/lib") {
 		t.Errorf("--top not applied:\n%s", out)
+	}
+
+	plain := renderWrappedPlain(w, 2)
+	for _, s := range []string{
+		"GitHub Wrapped 2025: @octo (Octo Cat)\nJan 1 – Dec 31, 2025, across all of GitHub\n",
+		"• 10 commits (across 2 repos)\n",
+		"• 2 pull requests merged (+105 −510 lines · median 10h to merge)\n",
+		"• plus 4 private contributions not visible to this token\n",
+		"• 1 repo created\n",
+		"• Top languages: Go 80% · TypeScript 20%\n",
+		"• You are: The Gatekeeper (",
+		"Jan 10 · Feb 0",
+		"By repo (top 2 of 3)\n",
+		"• acme/api: 8 commits, 5 PRs opened, 2 PRs merged, 7 reviews, 2 approvals, +105 −510 lines, 2 security fixes\n",
+		"• acme/web (private): 2 commits, 2 issues opened, 1 security fix\n",
+	} {
+		if !strings.Contains(plain, s) {
+			t.Errorf("plain render missing %q:\n%s", s, plain)
+		}
+	}
+	// Nothing that only lines up, or only shows, in a terminal.
+	for _, s := range []string{"\x1b", "─", "▁", "🔒", "  "} {
+		if strings.Contains(plain, s) {
+			t.Errorf("plain render contains %q:\n%s", s, plain)
+		}
+	}
+	if strings.Contains(plain, "other/lib") || !strings.Contains(renderWrappedPlain(w, 0), "other/lib") {
+		t.Errorf("--top not applied:\n%s", plain)
+	}
+}
+
+func TestWrappedOutputFlag(t *testing.T) {
+	for _, args := range [][]string{
+		{"--output", "xml"},
+		{"--output", "plain", "--json"},
+	} {
+		var stdout, stderr strings.Builder
+		if err := runWrapped(args, &stdout, &stderr); err == nil || !strings.Contains(err.Error(), "--output") {
+			t.Errorf("%v: error %v", args, err)
+		}
+	}
+}
+
+func TestTracedToUser(t *testing.T) {
+	fixed := time.Date(2025, 6, 1, 12, 0, 0, 0, time.UTC)
+	mine := alertChange{fixed.Add(-time.Minute), true}
+	for _, tt := range []struct {
+		name    string
+		changes []alertChange
+		want    bool
+	}{
+		{"nothing changed", nil, false},
+		{"the user's change", []alertChange{mine}, true},
+		{"someone else's change", []alertChange{{fixed.Add(-time.Minute), false}}, false},
+		{"the user's and someone else's", []alertChange{mine, {fixed.Add(-5 * time.Minute), false}}, false},
+		{"too long before", []alertChange{{fixed.Add(-alertFixWindow - time.Second), true}}, false},
+		{"after it closed", []alertChange{{fixed.Add(time.Minute), true}}, false},
+		{"someone else's after it closed", []alertChange{mine, {fixed.Add(time.Minute), false}}, true},
+	} {
+		if got := tracedToUser(fixed, tt.changes); got != tt.want {
+			t.Errorf("%s: got %v", tt.name, got)
+		}
 	}
 }
 

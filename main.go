@@ -208,7 +208,8 @@ func runWrapped(args []string, stdout, stderr io.Writer) error {
 	fs.SetOutput(stderr)
 	year := fs.Int("year", now.Year(), "the year to look back on (the current one runs to today)")
 	top := fs.Int("top", 15, "repos in the per-repo breakdown (0 for all)")
-	asJSON := fs.Bool("json", false, "print the numbers as JSON")
+	asJSON := fs.Bool("json", false, "print the numbers as JSON (same as --output json)")
+	output := fs.String("output", "text", "output format: text, plain (to paste into a document or chat) or json")
 	fs.Usage = func() {
 		fmt.Fprint(stderr, "Usage:\n  ghstat wrapped [flags]\n\nYour year across all of GitHub, overall and by repo.\n\nFlags:\n")
 		fs.PrintDefaults()
@@ -223,6 +224,17 @@ func runWrapped(args []string, stdout, stderr io.Writer) error {
 	if *top < 0 {
 		return fmt.Errorf("invalid --top %d", *top)
 	}
+	switch *output {
+	case "text", "plain", "json":
+	default:
+		return fmt.Errorf("invalid --output %q: want text, plain or json", *output)
+	}
+	if *asJSON {
+		if *output != "text" && *output != "json" {
+			return fmt.Errorf("--json and --output %s conflict", *output)
+		}
+		*output = "json"
+	}
 	from, to, err := yearRange(*year, now)
 	if err != nil {
 		return err
@@ -234,20 +246,24 @@ func runWrapped(args []string, stdout, stderr io.Writer) error {
 	}
 	f, isFile := stdout.(*os.File)
 	tty := isFile && term.IsTerminal(f.Fd())
-	if tty && !*asJSON {
+	if tty && *output != "json" {
 		fmt.Fprintf(stderr, "Gathering your %d on GitHub…\r", *year)
 	}
 	w, err := gh.wrapped(ctx, from, to)
-	if tty && !*asJSON {
+	if tty && *output != "json" {
 		fmt.Fprint(stderr, "\r\033[K")
 	}
 	if err != nil {
 		return err
 	}
-	if *asJSON {
+	switch *output {
+	case "json":
 		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", "  ")
 		return enc.Encode(w)
+	case "plain":
+		_, err = io.WriteString(stdout, renderWrappedPlain(w, *top))
+		return err
 	}
 	width := 100
 	if tty {

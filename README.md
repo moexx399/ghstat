@@ -62,7 +62,7 @@ ghstat list               print every repo's checks once
 ghstat badge [--ttl 5m]   print the cached check-results badge for tmux
 ghstat badge prs [--since 7d] [--ttl 5m]
                           print the cached open pull request badge for tmux
-ghstat wrapped [--year 2025] [--top 15] [--json]
+ghstat wrapped [--year 2025] [--top 15] [--output text|plain|json]
                           your year on GitHub, overall and by repo
 ```
 
@@ -88,8 +88,8 @@ GitHub (not just the repos file): the current year up to today, or any
   opened and merged (with lines added and removed and the median time to
   merge), reviews, PR approvals (and how many were bot PRs such as
   Dependabot's), change requests, issues opened, repos created, and
-  security vulnerabilities fixed (Dependabot alerts by severity, code
-  scanning alerts, and secret scanning alerts you resolved).
+  security vulnerabilities you fixed (Dependabot alerts by severity, and
+  secret scanning alerts you resolved).
   Commits, PRs, issues and reviews are also counted through search, because
   the contribution graph can leave out private repos; contributions, active
   days and streaks come from the graph alone.
@@ -100,14 +100,20 @@ GitHub (not just the repos file): the current year up to today, or any
 - **By repo**: commits, PRs opened and merged, reviews, approvals, issues,
   lines changed and security fixes per repo (`--top 0` for every repo).
 
-`--json` prints the same numbers for scripting.
+`--output plain` prints the same review without colors, columns or charts, so
+it pastes cleanly into a Word document or a team chat. Private repos are listed
+by name, so check it before sharing.
+`--output json` (or `--json`) prints the same numbers for scripting.
 
 Commits are counted the way your profile's contribution graph counts them
-(default branch, not forks). GitHub does not record who fixed a Dependabot or
-code scanning alert, so those count every fix in the repos you contributed
-to; they need a token that can read the repo's security alerts, and repos
-whose alerts it cannot read are reported. Secret scanning counts only alerts
-you resolved yourself. Merged PR details cover at most the 1,000 most recent
+(default branch, not forks). Security fixes count only what can be traced to
+you. GitHub does not record who fixed a Dependabot alert, so one counts only if
+every change to its manifest in the 15 minutes before it closed was yours: a PR
+you wrote, a bot's PR you merged, or a commit you pushed. Anything else is left
+out, so this can undercount. Code scanning alerts are not counted, because
+nothing ties them to who fixed them. Secret scanning counts only alerts you
+resolved yourself. All of these need a token that can read the repo's security
+alerts, and repos whose alerts it cannot read are reported. Merged PR details cover at most the 1,000 most recent
 (a GitHub search limit); the total is always exact.
 
 ### tmux

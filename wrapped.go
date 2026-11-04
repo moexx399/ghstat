@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -47,20 +48,19 @@ type Wrapped struct {
 
 // RepoWrapped is one repo's share of the year.
 type RepoWrapped struct {
-	Name              string `json:"name"`
-	Private           bool   `json:"private"`
-	Language          string `json:"language,omitempty"`
-	Commits           int    `json:"commits"`
-	PRsOpened         int    `json:"prs_opened"`
-	PRsMerged         int    `json:"prs_merged"`
-	Reviews           int    `json:"reviews"`
-	Approvals         int    `json:"approvals"`
-	Issues            int    `json:"issues_opened"`
-	Additions         int    `json:"additions"`
-	Deletions         int    `json:"deletions"`
-	DependabotFixed   int    `json:"dependabot_fixed"`
-	CodeScanningFixed int    `json:"code_scanning_fixed"`
-	SecretsResolved   int    `json:"secrets_resolved"`
+	Name            string `json:"name"`
+	Private         bool   `json:"private"`
+	Language        string `json:"language,omitempty"`
+	Commits         int    `json:"commits"`
+	PRsOpened       int    `json:"prs_opened"`
+	PRsMerged       int    `json:"prs_merged"`
+	Reviews         int    `json:"reviews"`
+	Approvals       int    `json:"approvals"`
+	Issues          int    `json:"issues_opened"`
+	Additions       int    `json:"additions"`
+	Deletions       int    `json:"deletions"`
+	DependabotFixed int    `json:"dependabot_fixed"`
+	SecretsResolved int    `json:"secrets_resolved"`
 }
 
 func (r RepoWrapped) activity() int {
@@ -69,24 +69,23 @@ func (r RepoWrapped) activity() int {
 
 // SecurityFixed is every security alert fixed or resolved in the repo.
 func (r RepoWrapped) SecurityFixed() int {
-	return r.DependabotFixed + r.CodeScanningFixed + r.SecretsResolved
+	return r.DependabotFixed + r.SecretsResolved
 }
 
-// SecurityStats counts security alerts closed in the period in the repos the
-// user contributed to. GitHub does not record who fixed a Dependabot or code
-// scanning alert, so those count the repo's fixes; secret scanning alerts
-// count only those the user resolved.
+// SecurityStats counts security alerts the user closed in the period, in the
+// repos they contributed to: Dependabot alerts whose fix traces to the user
+// (see tracedToUser) and secret scanning alerts they resolved. GitHub does not
+// record who fixed a code scanning alert, so those are left out.
 type SecurityStats struct {
-	DependabotFixed   int            `json:"dependabot_fixed"`
-	BySeverity        map[string]int `json:"dependabot_by_severity,omitempty"`
-	CodeScanningFixed int            `json:"code_scanning_fixed"`
-	SecretsResolved   int            `json:"secrets_resolved"` // by the user
-	ReposChecked      int            `json:"repos_checked"`    // at least one kind of alert readable
-	ReposUnavailable  int            `json:"repos_unavailable"`
+	DependabotFixed  int            `json:"dependabot_fixed"`
+	BySeverity       map[string]int `json:"dependabot_by_severity,omitempty"`
+	SecretsResolved  int            `json:"secrets_resolved"`
+	ReposChecked     int            `json:"repos_checked"` // at least one kind of alert readable
+	ReposUnavailable int            `json:"repos_unavailable"`
 }
 
 func (s SecurityStats) Total() int {
-	return s.DependabotFixed + s.CodeScanningFixed + s.SecretsResolved
+	return s.DependabotFixed + s.SecretsResolved
 }
 
 // CalendarStats comes from the contribution graph.
@@ -771,8 +770,8 @@ func (g *github) wrappedMerged(ctx context.Context, login string, from, to time.
 }
 
 // wrappedSecurity counts, in every repo the user contributed to, the
-// Dependabot and code scanning alerts fixed in the period, and the secret
-// scanning alerts the user resolved. Repos whose alerts the token cannot read
+// Dependabot alerts whose fix traces to the user in the period, and the secret
+// scanning alerts they resolved. Repos whose alerts the token cannot read
 // (no admin or security access, or the feature is off) are counted as
 // unavailable.
 func (g *github) wrappedSecurity(ctx context.Context, b *wrappedBuilder) {
@@ -799,8 +798,12 @@ func (g *github) wrappedSecurity(ctx context.Context, b *wrappedBuilder) {
 		if err != nil {
 			b.warn("Dependabot alerts: %v", err)
 		}
-		for name, sev := range fixed {
+		for name, alerts := range fixed {
 			ok(name)
+			sev, err := g.dependabotFixedByUser(ctx, name, w.Login, alerts)
+			if err != nil {
+				b.warn("Dependabot fixes in %s: %v", name, err)
+			}
 			for s, n := range sev {
 				b.repos[name].DependabotFixed += n // each repo is written by this goroutine only
 				mu.Lock()
@@ -814,16 +817,11 @@ func (g *github) wrappedSecurity(ctx context.Context, b *wrappedBuilder) {
 		}
 	})
 	sem := make(chan struct{}, 8)
-	codeScanning := make([]int, len(names))
 	secrets := make([]int, len(names))
 	for i, name := range names {
 		wg.Go(func() {
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			if n, err := g.codeScanningFixed(ctx, name, w.From, w.To); err == nil {
-				codeScanning[i] = n
-				ok(name)
-			}
 			if n, err := g.secretsResolved(ctx, name, w.Login, w.From, w.To); err == nil {
 				secrets[i] = n
 				ok(name)
@@ -832,31 +830,37 @@ func (g *github) wrappedSecurity(ctx context.Context, b *wrappedBuilder) {
 	}
 	wg.Wait()
 	for i, name := range names {
-		b.repos[name].CodeScanningFixed = codeScanning[i]
 		b.repos[name].SecretsResolved = secrets[i]
-		w.Security.CodeScanningFixed += codeScanning[i]
 		w.Security.SecretsResolved += secrets[i]
 	}
 	w.Security.ReposChecked = len(readable)
 	w.Security.ReposUnavailable = len(names) - len(readable)
 }
 
+// fixedAlert is a Dependabot alert GitHub marked as fixed.
+type fixedAlert struct {
+	Severity string
+	Manifest string
+	FixedAt  time.Time
+}
+
 // dependabotFixed returns, per readable repo, its Dependabot alerts fixed in
-// the period by severity, querying up to 25 repos per request.
-func (g *github) dependabotFixed(ctx context.Context, names []string, from, to time.Time) (map[string]map[string]int, error) {
+// the period, querying up to 25 repos per request.
+func (g *github) dependabotFixed(ctx context.Context, names []string, from, to time.Time) (map[string][]fixedAlert, error) {
 	type alerts struct {
 		VulnerabilityAlerts *struct {
 			PageInfo pageInfo
 			Nodes    []struct {
-				FixedAt               *time.Time
-				SecurityVulnerability *struct{ Severity string }
+				FixedAt                *time.Time
+				VulnerableManifestPath string
+				SecurityVulnerability  *struct{ Severity string }
 			}
 		}
 	}
-	out := map[string]map[string]int{}
+	out := map[string][]fixedAlert{}
 	tally := func(name string, a alerts) {
-		if out[name] == nil {
-			out[name] = map[string]int{}
+		if _, ok := out[name]; !ok {
+			out[name] = nil
 		}
 		for _, n := range a.VulnerabilityAlerts.Nodes {
 			if n.FixedAt == nil || n.FixedAt.Before(from) || n.FixedAt.After(to) {
@@ -866,7 +870,7 @@ func (g *github) dependabotFixed(ctx context.Context, names []string, from, to t
 			if n.SecurityVulnerability != nil {
 				sev = n.SecurityVulnerability.Severity
 			}
-			out[name][sev]++
+			out[name] = append(out[name], fixedAlert{sev, n.VulnerableManifestPath, *n.FixedAt})
 		}
 	}
 	var errs []error
@@ -930,33 +934,167 @@ func (g *github) dependabotFixed(ctx context.Context, names []string, from, to t
 
 // alertsSelection selects a page of a repo's fixed Dependabot alerts; %s
 // is further arguments.
-const alertsSelection = `vulnerabilityAlerts(states: [FIXED], first: 100%s) { pageInfo { hasNextPage endCursor } nodes { fixedAt securityVulnerability { severity } } }`
+const alertsSelection = `vulnerabilityAlerts(states: [FIXED], first: 100%s) { pageInfo { hasNextPage endCursor } nodes { fixedAt vulnerableManifestPath securityVulnerability { severity } } }`
 
-// codeScanningFixed counts the repo's code scanning alerts fixed in the
-// period, newest-updated first, stopping at alerts last updated before it.
-func (g *github) codeScanningFixed(ctx context.Context, repo string, from, to time.Time) (int, error) {
-	n := 0
-	q := url.Values{"state": {"fixed"}, "sort": {"updated"}, "direction": {"desc"}, "per_page": {"100"}}
-	next := "/repos/" + repo + "/code-scanning/alerts?" + q.Encode()
-	for next != "" {
-		var page []struct {
-			FixedAt   *time.Time `json:"fixed_at"`
-			UpdatedAt time.Time  `json:"updated_at"`
+// alertFixWindow is how long before an alert closed a change can have fixed
+// it. GitHub closes alerts about a minute after the fix reaches the default
+// branch; a later close is not counted, rather than guessed at.
+const alertFixWindow = 15 * time.Minute
+
+// alertChange is a change to an alert's manifest on the default branch.
+type alertChange struct {
+	At   time.Time
+	Mine bool // the user made it, or merged a bot's PR making it
+}
+
+// tracedToUser reports whether an alert's fix can only have come from the
+// user: GitHub does not link a fixed alert to what fixed it, so this needs at
+// least one change to the manifest just before the alert closed, all of them
+// the user's.
+func tracedToUser(fixedAt time.Time, changes []alertChange) bool {
+	found := false
+	for _, c := range changes {
+		if c.At.Before(fixedAt.Add(-alertFixWindow)) || c.At.After(fixedAt) {
+			continue
 		}
-		var err error
-		if next, err = g.get(ctx, next, &page); err != nil {
-			return n, err
+		if !c.Mine {
+			return false
 		}
-		for _, a := range page {
-			if a.UpdatedAt.Before(from) {
-				return n, nil
-			}
-			if a.FixedAt != nil && !a.FixedAt.Before(from) && !a.FixedAt.After(to) {
-				n++
+		found = true
+	}
+	return found
+}
+
+// dependabotFixedByUser counts, by severity, the alerts whose fix traces to
+// login. Alerts closed around the same time share a lookup.
+func (g *github) dependabotFixedByUser(ctx context.Context, repo, login string, alerts []fixedAlert) (map[string]int, error) {
+	alerts = slices.Clone(alerts)
+	slices.SortFunc(alerts, func(a, b fixedAlert) int {
+		return cmp.Or(cmp.Compare(a.Manifest, b.Manifest), a.FixedAt.Compare(b.FixedAt))
+	})
+	out := map[string]int{}
+	var errs []error
+	for start := 0; start < len(alerts); {
+		end := start + 1
+		for end < len(alerts) && alerts[end].Manifest == alerts[start].Manifest && alerts[end].FixedAt.Sub(alerts[start].FixedAt) <= alertFixWindow {
+			end++
+		}
+		batch := alerts[start:end]
+		start = end
+		if batch[0].Manifest == "" {
+			continue
+		}
+		changes, err := g.manifestChanges(ctx, repo, login, batch[0].Manifest, batch[0].FixedAt.Add(-alertFixWindow), batch[len(batch)-1].FixedAt)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		for _, a := range batch {
+			if tracedToUser(a.FixedAt, changes) {
+				out[a.Severity]++
 			}
 		}
 	}
-	return n, nil
+	return out, errors.Join(errs...)
+}
+
+const gqlManifestChanges = `query($q: String!, $o: String!, $n: String!, $path: String!, $since: GitTimestamp!, $until: GitTimestamp!) {
+  search(type: ISSUE, first: 100, query: $q) {
+    pageInfo { hasNextPage }
+    nodes { ... on PullRequest { mergedAt mergedBy { login } author { __typename login } files(first: 100) { pageInfo { hasNextPage } nodes { path } } } }
+  }
+  repository(owner: $o, name: $n) { defaultBranchRef { target { ... on Commit {
+    history(first: 100, path: $path, since: $since, until: $until) {
+      pageInfo { hasNextPage }
+      nodes { committedDate author { user { login } } associatedPullRequests(first: 5) { nodes { mergedAt } } }
+    }
+  } } } }
+}`
+
+// manifestChanges returns the merged PRs and direct pushes that changed path
+// on the default branch between since and until. It returns nothing when
+// there are too many to read, so that no alert is traced from part of them.
+func (g *github) manifestChanges(ctx context.Context, repo, login, path string, since, until time.Time) ([]alertChange, error) {
+	owner, name, _ := strings.Cut(repo, "/")
+	data, _, err := g.graphql(ctx, gqlManifestChanges, map[string]any{
+		"q": fmt.Sprintf("repo:%s is:pr is:merged merged:%s..%s", repo, since.UTC().Format(time.RFC3339), until.UTC().Format(time.RFC3339)),
+		"o": owner, "n": name, "path": path,
+		"since": since.UTC().Format(time.RFC3339), "until": until.UTC().Format(time.RFC3339),
+	})
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Search struct {
+			PageInfo pageInfo
+			Nodes    []struct {
+				MergedAt *time.Time
+				MergedBy *struct{ Login string }
+				Author   *struct {
+					Typename string `json:"__typename"`
+					Login    string
+				}
+				Files *struct {
+					PageInfo pageInfo
+					Nodes    []struct{ Path string }
+				}
+			}
+		}
+		Repository *struct {
+			DefaultBranchRef *struct {
+				Target struct {
+					History struct {
+						PageInfo pageInfo
+						Nodes    []struct {
+							CommittedDate          time.Time
+							Author                 *struct{ User *struct{ Login string } }
+							AssociatedPullRequests struct {
+								Nodes []struct{ MergedAt *time.Time }
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	if resp.Repository == nil || resp.Repository.DefaultBranchRef == nil {
+		return nil, nil
+	}
+	history := resp.Repository.DefaultBranchRef.Target.History
+	if resp.Search.PageInfo.HasNextPage || history.PageInfo.HasNextPage {
+		return nil, nil
+	}
+	var out []alertChange
+	for _, p := range resp.Search.Nodes {
+		if p.MergedAt == nil || p.Files == nil {
+			continue
+		}
+		touched := p.Files.PageInfo.HasNextPage // may be among the files not read: not the user's, to be safe
+		for _, f := range p.Files.Nodes {
+			touched = touched || f.Path == path
+		}
+		if !touched {
+			continue
+		}
+		mine := false
+		if p.Author != nil && !p.Files.PageInfo.HasNextPage {
+			merged := p.MergedBy != nil && strings.EqualFold(p.MergedBy.Login, login)
+			mine = strings.EqualFold(p.Author.Login, login) || (p.Author.Typename == "Bot" && merged)
+		}
+		out = append(out, alertChange{*p.MergedAt, mine})
+	}
+	for _, c := range history.Nodes {
+		// Commits from a PR count when it merged, above.
+		if slices.ContainsFunc(c.AssociatedPullRequests.Nodes, func(p struct{ MergedAt *time.Time }) bool { return p.MergedAt != nil }) {
+			continue
+		}
+		mine := c.Author != nil && c.Author.User != nil && strings.EqualFold(c.Author.User.Login, login)
+		out = append(out, alertChange{c.CommittedDate, mine})
+	}
+	return out, nil
 }
 
 // secretsResolved counts the repo's secret scanning alerts that login
